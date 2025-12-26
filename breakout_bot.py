@@ -10,43 +10,44 @@ from datetime import datetime, timezone
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Ayarlar
-NEAR_PCT = float(os.getenv("NEAR_PCT", "1.0"))          # Dirence % kaç kala uyarı? (1.0 => %1 kala)
-LOOKBACK_4H = int(os.getenv("LOOKBACK_4H", "120"))      # 4h swing direnci için kaç mum geriye bakılsın
-LOOKBACK_1D = int(os.getenv("LOOKBACK_1D", "120"))      # 1d swing direnci için kaç mum
-CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "200"))    # Gate limit (max 1000 ama biz 200 yeter)
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "60"))   # Döngü arası bekleme
-MAX_PAIRS = int(os.getenv("MAX_PAIRS", "120"))          # Her turda kaç USDT parite taransın
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "180"))    # Aynı uyarıyı tekrar atma süresi (dk)
+# Ayarlar (istersen Render env'den değiştirebilirsin)
+NEAR_PCT = float(os.getenv("NEAR_PCT", "1.0"))          # Breakout seviyesine ne kadar yakınsa (yüzde)
+LOOKBACK_4H = int(os.getenv("LOOKBACK_4H", "50"))       # 4H breakout için kaç mum geri bakılsın
+LOOKBACK_1D = int(os.getenv("LOOKBACK_1D", "30"))       # 1D breakout için kaç mum geri bakılsın
+CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "300"))    # API'den çekilecek mum limiti
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "90"))   # tur arası bekleme
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "120"))          # her turda taranacak max parite
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "180"))    # aynı pariteye tekrar sinyal atmadan önce (dk)
 
 STATE_FILE = "state.json"
 
 GATE_BASE = "https://api.gateio.ws/api/v4"
 
-
 # =========================
-# Utils
+# Helpers
 # =========================
-def now_utc_ts() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
+def now_ts() -> int:
+    return int(time.time())
 
 def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"last_alert": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {}
+        return {"last_alert": {}}
 
-def save_state(state: dict):
+def save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
+            json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-def tg_send(text: str):
+def send_message(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN / CHAT_ID eksik.")
+        print("❌ BOT_TOKEN veya CHAT_ID eksik. Render Env'e ekle.")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -55,182 +56,165 @@ def tg_send(text: str):
         "disable_web_page_preview": True
     }
     try:
-        r = requests.post(url, json=payload, timeout=15)
+        r = requests.post(url, json=payload, timeout=20)
         if r.status_code != 200:
             print("Telegram send error:", r.status_code, r.text[:200])
     except Exception as e:
-        print("Telegram exception:", e)
+        print("Telegram send exception:", e)
 
-def gate_get(path: str, params: dict | None = None):
+def gate_get(path: str, params=None):
     url = f"{GATE_BASE}{path}"
-    r = requests.get(url, params=params, timeout=20)
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def fmt_pct(x: float) -> str:
-    return f"{x:.2f}%"
-
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
-
-
 # =========================
-# Gate.io Data
-# Candles format (Gate Spot):
-# response: list of arrays like:
-# [timestamp, volume, close, high, low, open]
-# all fields are strings
+# Gate.io Market Data
 # =========================
-def get_usdt_pairs() -> list[str]:
-    pairs = gate_get("/spot/currency_pairs")
-    out = []
-    for p in pairs:
-        try:
-            if p.get("quote") == "USDT" and p.get("trade_status") == "tradable":
-                out.append(p["id"])  # e.g. "BTC_USDT"
-        except Exception:
-            continue
-    # Çok fazla olmasın diye stabil sırala
-    out.sort()
-    return out
+def fetch_usdt_pairs():
+    """
+    Spot market USDT quote pariteleri.
+    Gate format: BTC_USDT
+    """
+    tickers = gate_get("/spot/tickers")
+    pairs = []
+    for t in tickers:
+        cur = t.get("currency_pair", "")
+        if cur.endswith("_USDT"):
+            pairs.append(cur)
+    # stabil sıralama
+    pairs.sort()
+    return pairs
 
-def get_candles(pair: str, interval: str, limit: int):
-    # interval: "4h" or "1d"
+def fetch_last_price(pair: str) -> float:
+    t = gate_get("/spot/tickers", params={"currency_pair": pair})
+    # API bazen liste döndürür
+    if isinstance(t, list) and len(t) > 0:
+        return float(t[0].get("last", "0"))
+    if isinstance(t, dict):
+        return float(t.get("last", "0"))
+    return 0.0
+
+def fetch_candles(pair: str, interval: str, limit: int):
+    """
+    interval örn: '4h', '1d'
+    Gate candles: /spot/candlesticks
+    dönüş: list of [t, v, c, h, l, o] (string)
+    """
     data = gate_get("/spot/candlesticks", params={
         "currency_pair": pair,
         "interval": interval,
         "limit": limit
     })
-    # Gate genelde en yeni mumdan eskiye döndürür; biz kronolojik yapalım:
-    data = list(reversed(data))
+    # en yeni -> en eski gelebilir, biz zamanına göre sırala
+    # t alanı epoch seconds string
+    data.sort(key=lambda x: int(x[0]))
     return data
 
-def swing_resistance(candles, lookback: int) -> float:
-    """
-    Basit swing direnç:
-    - son mum hariç (henüz kapanmamış olabilir)
-    - son 'lookback' mum içindeki en yüksek 'high'
-    """
-    if len(candles) < 10:
-        return float("nan")
-    usable = candles[:-1]  # son mumu çıkar
-    if lookback > len(usable):
-        lookback = len(usable)
-    window = usable[-lookback:]
-    highs = [safe_float(c[3]) for c in window]  # high index=3
-    return max(highs) if highs else float("nan")
-
-def last_close(candles) -> float:
-    if not candles:
-        return float("nan")
-    return safe_float(candles[-1][2])  # close index=2
-
+def highest_high(candles, lookback: int):
+    # candles format: [t, v, c, h, l, o]
+    # son mum hariç lookback kadar geriye bak (breakout için geçmiş tepe)
+    if len(candles) < lookback + 2:
+        return None
+    subset = candles[-(lookback+1):-1]  # son (current) mum hariç
+    highs = [float(x[3]) for x in subset]
+    return max(highs) if highs else None
 
 # =========================
-# Signal Logic
+# Breakout Logic
 # =========================
-def check_pair(pair: str, state: dict):
+def is_near_breakout(last_price: float, level: float, near_pct: float) -> bool:
+    if level <= 0:
+        return False
+    diff_pct = (last_price - level) / level * 100.0
+    return diff_pct >= 0 and diff_pct <= near_pct
+
+def is_confirmed_breakout(candles, level: float) -> bool:
     """
-    4h ve 1d için:
-    - Dirence yakın: close, dirençten NEAR_PCT aşağıdaysa
-    - Breakout: close direnç üstüne attıysa
+    Basit onay:
+    - Son kapanış (c) level'ın üstünde
     """
-    results = []
-    for tf, interval, lookback in [
-        ("4H", "4h", LOOKBACK_4H),
-        ("1D", "1d", LOOKBACK_1D),
-    ]:
-        candles = get_candles(pair, interval=interval, limit=CANDLE_LIMIT)
-        c = last_close(candles)
-        r = swing_resistance(candles, lookback=lookback)
-        if not (c > 0 and r > 0):
-            continue
+    if not candles or level is None:
+        return False
+    last_close = float(candles[-1][2])
+    return last_close > level
 
-        dist_pct = (r - c) / r * 100.0  # dirençten ne kadar aşağıda
-        breakout = c > r
-        near = (0 <= dist_pct <= NEAR_PCT)
+def cooldown_ok(state, key: str, cooldown_min: int) -> bool:
+    last = state.get("last_alert", {}).get(key, 0)
+    return (now_ts() - last) >= cooldown_min * 60
 
-        # cooldown key
-        key = f"{pair}:{tf}:{'breakout' if breakout else 'near' if near else 'none'}"
-        last_sent = state.get(key, 0)
-        cooldown_sec = COOLDOWN_MIN * 60
+def mark_alert(state, key: str):
+    state.setdefault("last_alert", {})[key] = now_ts()
 
-        if breakout:
-            if now_utc_ts() - last_sent >= cooldown_sec:
-                results.append((tf, "BREAKOUT", c, r, dist_pct, key))
-        elif near:
-            if now_utc_ts() - last_sent >= cooldown_sec:
-                results.append((tf, "NEAR", c, r, dist_pct, key))
-
-    return results
-
-
+# =========================
+# Main loop
+# =========================
 def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        print("❌ BOT_TOKEN veya CHAT_ID yok. Render -> Environment Variables ekle.")
-        return
-
     state = load_state()
-    tg_send("✅ Breakout bot (Gate.io) başladı. 4H & 1D tarama aktif.")
 
-    pairs = get_usdt_pairs()
-    if not pairs:
-        tg_send("❌ USDT pariteleri çekilemedi (Gate.io).")
-        return
-
-    tg_send(f"📌 Toplam {len(pairs)} USDT parite bulundu. Her turda MAX_PAIRS={MAX_PAIRS} taranacak.")
+    send_message("✅ Breakout bot (Gate.io) başladı. 4H & 1D tarama aktif.")
+    pairs = fetch_usdt_pairs()
+    send_message(f"📌 Toplam {len(pairs)} USDT parite bulundu. Her turda MAX_PAIRS={MAX_PAIRS} taranacak.")
 
     idx = 0
     while True:
         try:
-            # döngüde pariteleri sırayla gez
+            # her turda MAX_PAIRS kadar parite döndür (round-robin)
             batch = []
-            for _ in range(MAX_PAIRS):
-                batch.append(pairs[idx])
-                idx = (idx + 1) % len(pairs)
+            for _ in range(min(MAX_PAIRS, len(pairs))):
+                batch.append(pairs[idx % len(pairs)])
+                idx += 1
 
             for pair in batch:
                 try:
-                    hits = check_pair(pair, state)
-                    for tf, kind, close_p, res_p, dist_pct, key in hits:
-                        symbol = pair.replace("_", "/")
-                        if kind == "BREAKOUT":
-                            msg = (
-                                f"🚀 BREAKOUT ({tf})\n"
-                                f"{symbol}\n"
-                                f"Close: {close_p:.6g}\n"
-                                f"Direnç: {res_p:.6g}\n"
-                                f"Mesafe: -{fmt_pct(abs(dist_pct))} (üstünde)\n"
-                            )
-                        else:
-                            msg = (
-                                f"⚠️ Dirence Yakın ({tf})\n"
-                                f"{symbol}\n"
-                                f"Close: {close_p:.6g}\n"
-                                f"Direnç: {res_p:.6g}\n"
-                                f"Kalan: {fmt_pct(dist_pct)}\n"
-                            )
-                        tg_send(msg)
-                        state[key] = now_utc_ts()
-                        save_state(state)
+                    last_price = fetch_last_price(pair)
+                    if last_price <= 0:
+                        continue
 
-                except requests.HTTPError as e:
-                    # Gate bazen rate limit / geçici hata
-                    print("HTTPError:", pair, str(e))
-                    continue
+                    # 4H
+                    c4 = fetch_candles(pair, "4h", CANDLE_LIMIT)
+                    lvl4 = highest_high(c4, LOOKBACK_4H)
+                    if lvl4 and cooldown_ok(state, f"{pair}|4h", COOLDOWN_MIN):
+                        if is_confirmed_breakout(c4, lvl4) and is_near_breakout(last_price, lvl4, NEAR_PCT):
+                            msg = (
+                                f"🚀 4H Breakout Yakın/Onay!\n"
+                                f"Pair: {pair}\n"
+                                f"Fiyat: {last_price:.6g}\n"
+                                f"Seviye(4H {LOOKBACK_4H}H): {lvl4:.6g}\n"
+                                f"Yakınlık: <= %{NEAR_PCT}\n"
+                                f"Zaman: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                            )
+                            send_message(msg)
+                            mark_alert(state, f"{pair}|4h")
+                            save_state(state)
+
+                    # 1D
+                    c1 = fetch_candles(pair, "1d", CANDLE_LIMIT)
+                    lvl1 = highest_high(c1, LOOKBACK_1D)
+                    if lvl1 and cooldown_ok(state, f"{pair}|1d", COOLDOWN_MIN):
+                        if is_confirmed_breakout(c1, lvl1) and is_near_breakout(last_price, lvl1, NEAR_PCT):
+                            msg = (
+                                f"🔥 1D Breakout Yakın/Onay!\n"
+                                f"Pair: {pair}\n"
+                                f"Fiyat: {last_price:.6g}\n"
+                                f"Seviye(1D {LOOKBACK_1D}D): {lvl1:.6g}\n"
+                                f"Yakınlık: <= %{NEAR_PCT}\n"
+                                f"Zaman: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                            )
+                            send_message(msg)
+                            mark_alert(state, f"{pair}|1d")
+                            save_state(state)
+
+                    time.sleep(0.2)
+
                 except Exception as e:
-                    print("Err:", pair, e)
-                    continue
+                    print("pair error:", pair, e)
 
             time.sleep(SLEEP_SECONDS)
 
         except Exception as e:
-            print("Loop error:", e)
+            print("loop error:", e)
             time.sleep(10)
-
 
 if __name__ == "__main__":
     main()
