@@ -1,52 +1,86 @@
 import os
 import time
+import math
 import json
-import requests
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# =========================
+import requests
+
+# =========================================================
 # ENV (Render -> Environment Variables)
-# =========================
+# =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Tarama ayarları
-LOOKBACK_4H = int(os.getenv("LOOKBACK_4H", "50"))      # direnç için geçmiş mum sayısı
-LOOKBACK_1D = int(os.getenv("LOOKBACK_1D", "50"))
-CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "220"))   # mum çekme limiti
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "60"))
-MAX_PAIRS = int(os.getenv("MAX_PAIRS", "120"))         # her tur taranacak max pair
-NEAR_PCT = float(os.getenv("NEAR_PCT", "1.0"))         # dirence yakınlık yüzdesi
+# Render Web Service port (zorunlu)
+PORT = int(os.getenv("PORT", "10000"))
 
-# Filtreler
+# Genel ayarlar
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "120"))          # kaç saniyede bir tarasın
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "120"))                  # her turda kaç parite
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "15"))             # aynı coin tekrar mesaj min.
+COOLDOWN_SEC = COOLDOWN_MIN * 60
+
+# Breakout yakınlık / onay
+NEAR_PCT = float(os.getenv("NEAR_PCT", "1.0"))                  # dirence yakınlık %
+CONFIRM_BREAKOUT = os.getenv("CONFIRM_BREAKOUT", "1") == "1"    # 1=close üstünde onay
+
+# Timeframe lookback (direnç hesap)
+LOOKBACK_1H = int(os.getenv("LOOKBACK_1H", "50"))
+LOOKBACK_4H = int(os.getenv("LOOKBACK_4H", "50"))
+LOOKBACK_1D = int(os.getenv("LOOKBACK_1D", "30"))
+
+# EMA ve hacim filtresi
 EMA_FAST = int(os.getenv("EMA_FAST", "21"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "55"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
+VOL_LOOKBACK = int(os.getenv("VOL_LOOKBACK", "20"))             # ortalama hacim için geçmiş bar
+VOL_MULT = float(os.getenv("VOL_MULT", "1.8"))                  # son hacim >= ort * VOL_MULT
 
-VOL_MULT = float(os.getenv("VOL_MULT", "1.8"))          # son kapanan mum hacmi >= ort*VOL_MULT
-VOL_AVG_LEN = int(os.getenv("VOL_AVG_LEN", "20"))
-
-WICK_MAX_PCT = float(os.getenv("WICK_MAX_PCT", "0.6"))  # üst fitil % max
-BODY_MIN_PCT = float(os.getenv("BODY_MIN_PCT", "0.2"))  # gövde % min
-
-COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "15"))     # aynı coin aynı tf mesaj aralığı
-TREND_TFS = [x.strip().lower() for x in os.getenv("TREND_TFS", "1h,4h,1d").split(",") if x.strip()]
+# Fake breakout filtresi (mum gövdesi)
+MIN_BODY_PCT = float(os.getenv("MIN_BODY_PCT", "0.25"))         # body/(high-low) en az
 
 STATE_FILE = "state.json"
 GATE_BASE = "https://api.gateio.ws/api/v4"
 
+# =========================================================
+# Basit HTTP server (Render Web Service port zorunluluğu için)
+# =========================================================
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"ok")
 
-# =========================
-# Helpers
-# =========================
-def now_ts():
-    return int(time.time())
+def start_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()
 
+# =========================================================
+# Telegram
+# =========================================================
+def send_message(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("BOT_TOKEN / CHAT_ID eksik.")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    try:
+        requests.post(url, json=payload, timeout=20)
+    except Exception as e:
+        print("Telegram hata:", e)
+
+# =========================================================
+# State (cooldown)
+# =========================================================
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"last_alert_ts": {}}
+        return {"last_sent": {}}
 
 def save_state(state):
     try:
@@ -55,317 +89,208 @@ def save_state(state):
     except Exception:
         pass
 
-def send_message(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN/CHAT_ID eksik. Mesaj gönderilemedi.")
-        print(text)
-        return
+def can_send(state, key: str) -> bool:
+    now = int(time.time())
+    last = int(state["last_sent"].get(key, 0))
+    return (now - last) >= COOLDOWN_SEC
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
-    try:
-        requests.post(url, json=payload, timeout=20)
-    except Exception as e:
-        print("Telegram send error:", e)
+def mark_sent(state, key: str):
+    state["last_sent"][key] = int(time.time())
 
-def cooldown_ok(state, key: str):
-    last = state.get("last_alert_ts", {}).get(key, 0)
-    return (now_ts() - last) >= COOLDOWN_MIN * 60
-
-def mark_alert(state, key: str):
-    state.setdefault("last_alert_ts", {})
-    state["last_alert_ts"][key] = now_ts()
-
-
-# =========================
-# EMA / Filters
-# =========================
-def ema(values, period):
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = (v * k) + (e * (1 - k))
-    return e
-
-def ema_series(values, period):
-    if len(values) < period:
-        return []
-    k = 2 / (period + 1)
-    out = []
-    e = values[0]
-    out.append(e)
-    for v in values[1:]:
-        e = (v * k) + (e * (1 - k))
-        out.append(e)
-    return out
-
-def crossed_up(closes, fast=EMA_FAST, slow=EMA_SLOW, lookback=8):
-    # Son lookback mum içinde EMA fast, EMA slow'u yukarı kesti mi?
-    need = max(fast, slow) + lookback + 5
-    if len(closes) < need:
-        return False
-    ef = ema_series(closes, fast)
-    es = ema_series(closes, slow)
-    start = max(1, len(closes) - lookback - 2)
-    for i in range(start, len(closes)):
-        if ef[i-1] <= es[i-1] and ef[i] > es[i]:
-            return True
-    return False
-
-def trend_up(closes):
-    # EMA_FAST > EMA_SLOW ise trend yukarı
-    if len(closes) < max(EMA_FAST, EMA_SLOW) + 5:
-        return False
-    ef = ema(closes, EMA_FAST)
-    es = ema(closes, EMA_SLOW)
-    return (ef is not None and es is not None and ef > es)
-
-def volume_ok(volumes):
-    # Son kapanan mum hacmi / ortalama hacim >= VOL_MULT
-    if len(volumes) < VOL_AVG_LEN + 5:
-        return False
-    last = volumes[-2]  # kapanmış son mum
-    avg_slice = volumes[-(VOL_AVG_LEN+2):-2]
-    avg = sum(avg_slice) / max(1, len(avg_slice))
-    if avg <= 0:
-        return False
-    return last >= avg * VOL_MULT
-
-def fake_breakout_filter(last_closed_candle):
-    # candle: [t, volume, close, high, low, open] (Gate format)
-    # biz parse ederken o,h,l,c,v yapacağız. burada (o,h,l,c) üzerinden bakıyoruz.
-    o, h, l, c, v = last_closed_candle
-    if o <= 0 or c <= 0:
-        return False
-
-    body_pct = abs(c - o) / o * 100.0
-    upper_wick_pct = (h - max(o, c)) / c * 100.0
-
-    # Gövde çok küçükse veya üst fitil çok uzunsa fake ihtimali
-    if body_pct < BODY_MIN_PCT:
-        return False
-    if upper_wick_pct > WICK_MAX_PCT:
-        return False
-    return True
-
-
-# =========================
-# Gate.io API
-# =========================
-_session = requests.Session()
-
+# =========================================================
+# Gate.io yardımcılar
+# =========================================================
 def gate_get(path, params=None):
     url = f"{GATE_BASE}{path}"
-    r = _session.get(url, params=params, timeout=25)
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def list_usdt_pairs():
-    # /spot/tickers -> currency_pair listesi
-    data = gate_get("/spot/tickers")
+def get_usdt_pairs():
+    # spot currency_pairs
+    data = gate_get("/spot/currency_pairs")
     pairs = []
-    for item in data:
-        cp = item.get("currency_pair", "")
-        if not cp:
-            continue
-        # USDT quote filtre
-        if cp.endswith("_USDT"):
-            pairs.append(cp)
-    # stabil olsun diye sort
-    pairs.sort()
+    for p in data:
+        # id örn: "BTC_USDT"
+        pid = p.get("id", "")
+        if pid.endswith("_USDT") and p.get("trade_status") == "tradable":
+            pairs.append(pid)
     return pairs
 
-def fetch_gate_candles(symbol, tf, limit=CANDLE_LIMIT):
-    # Gate endpoint: /spot/candlesticks
-    # interval: 1m,5m,15m,30m,1h,4h,1d
-    params = {"currency_pair": symbol, "interval": tf, "limit": str(limit)}
-    data = gate_get("/spot/candlesticks", params=params)
-    # Gate candlestick: [t, v, c, h, l, o] strings
-    # Sıralama genelde newest-first geliyor; biz oldest-first yapacağız.
-    # Güvenli olsun:
-    if not data:
-        return []
-
-    # convert + reverse
-    out = []
+def get_candles(pair: str, interval: str, limit: int):
+    # /spot/candlesticks -> array, newest last (çoğu zaman)
+    # fields: [t, volume, close, high, low, open] (Gate v4)
+    data = gate_get("/spot/candlesticks", params={"currency_pair": pair, "interval": interval, "limit": limit})
+    # Gate bazen newest first döndürebiliyor; timestamp'e göre sırala
+    candles = []
     for row in data:
         try:
-            t = int(float(row[0]))
+            t = int(row[0])
             v = float(row[1])
             c = float(row[2])
             h = float(row[3])
             l = float(row[4])
             o = float(row[5])
-            out.append((t, o, h, l, c, v))
+            candles.append((t, o, h, l, c, v))
         except Exception:
             continue
+    candles.sort(key=lambda x: x[0])
+    return candles
 
-    # oldest first
-    out.sort(key=lambda x: x[0])
-    return out
+# =========================================================
+# İndikatörler
+# =========================================================
+def ema(values, period: int):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for x in values[1:]:
+        e = (x * k) + (e * (1 - k))
+    return e
 
+def ema_trend(closes, fast, slow):
+    ef = ema(closes, fast)
+    es = ema(closes, slow)
+    if ef is None or es is None:
+        return None
+    if ef > es:
+        return "UP"
+    if ef < es:
+        return "DOWN"
+    return "FLAT"
 
-# =========================
-# Trend alignment (1h+4h+1d)
-# =========================
-def trend_alignment(symbol):
-    for tf in TREND_TFS:
-        candles = fetch_gate_candles(symbol, tf, limit=max(CANDLE_LIMIT, EMA_SLOW + 80))
-        if len(candles) < max(EMA_SLOW + 10, 80):
-            return False
-        closes = [x[4] for x in candles]  # c
-        if not trend_up(closes):
-            return False
-    return True
+def volume_spike(volumes, lookback, mult):
+    if len(volumes) < lookback + 1:
+        return False
+    recent = volumes[-1]
+    avg = sum(volumes[-(lookback+1):-1]) / lookback
+    if avg <= 0:
+        return False
+    return recent >= avg * mult
 
+def body_ok(o, h, l, c, min_body_pct):
+    rng = h - l
+    if rng <= 0:
+        return False
+    body = abs(c - o)
+    return (body / rng) >= min_body_pct
 
-# =========================
+# =========================================================
 # Breakout logic
-# =========================
-def compute_resistance(candles, lookback):
-    # candles: (t,o,h,l,c,v) oldest->newest
-    # resistance: geçmiş lookback mumun en yüksek high değeri (son kapanmış mumu hariç tutuyoruz)
-    if len(candles) < lookback + 5:
-        return None
-    highs = [x[2] for x in candles]  # h
-    # son kapanmış mum: -2, current forming: -1 -> ikisini de dışarıda bırakmak daha temiz
-    window = highs[-(lookback+2):-2]
-    if not window:
-        return None
-    return max(window)
+# =========================================================
+def analyze_pair(pair: str, state):
+    # --- 1H / 4H / 1D trend (EMA filtresi)
+    c1h = get_candles(pair, "1h", max(LOOKBACK_1H, EMA_SLOW + 5, VOL_LOOKBACK + 5))
+    c4h = get_candles(pair, "4h", max(LOOKBACK_4H, EMA_SLOW + 5, VOL_LOOKBACK + 5))
+    c1d = get_candles(pair, "1d", max(LOOKBACK_1D, EMA_SLOW + 5, VOL_LOOKBACK + 5))
 
-def analyze_symbol_tf(state, symbol, tf, lookback):
-    candles = fetch_gate_candles(symbol, tf, limit=max(CANDLE_LIMIT, EMA_SLOW + 80))
-    if len(candles) < max(lookback + 10, EMA_SLOW + 20):
+    if len(c4h) < 10 or len(c1d) < 10:
         return
 
-    # Son kapanmış mum (-2)
-    t, o, h, l, c, v = candles[-2]
-    last_closed = (o, h, l, c, v)
+    closes_1h = [x[4] for x in c1h]
+    closes_4h = [x[4] for x in c4h]
+    closes_1d = [x[4] for x in c1d]
 
-    resistance = compute_resistance(candles, lookback)
-    if not resistance or resistance <= 0:
-        return
+    trend_1h = ema_trend(closes_1h[-(EMA_SLOW+5):], EMA_FAST, EMA_SLOW)
+    trend_4h = ema_trend(closes_4h[-(EMA_SLOW+5):], EMA_FAST, EMA_SLOW)
+    trend_1d = ema_trend(closes_1d[-(EMA_SLOW+5):], EMA_FAST, EMA_SLOW)
 
-    # Yakınlık %:
-    near_pct = ((resistance - c) / resistance) * 100.0
+    aligned = (trend_1h == trend_4h == trend_1d) and trend_1h in ("UP", "DOWN")
 
-    closes = [x[4] for x in candles]
-    volumes = [x[5] for x in candles]
+    # --- Breakout taraması: 4H ve 1D üzerinde direnç/tepe
+    checks = [
+        ("4H", c4h, LOOKBACK_4H, "4h"),
+        ("1D", c1d, LOOKBACK_1D, "1d"),
+    ]
 
-    # Trend alignment şartı (1h+4h+1d)
-    if not trend_alignment(symbol):
-        return
+    for tf_name, candles, lb, interval in checks:
+        # Direnç: son lb barın (son bar hariç) en yüksek high'ı
+        window = candles[-(lb+1):-1] if len(candles) >= lb + 2 else candles[:-1]
+        if len(window) < 5:
+            continue
 
-    # Fake filtre + hacim + EMA cross şartları (breakout ve near için de kalite)
-    if not fake_breakout_filter(last_closed):
-        return
-    if not volume_ok(volumes):
-        return
-    if not crossed_up(closes):
-        return
+        resistance = max(x[2] for x in window)  # high
+        last = candles[-1]
+        t, o, h, l, c, v = last
 
-    # Cooldown (near ve breakout ayrı anahtar olsun)
-    key_near = f"{symbol}:{tf}:near"
-    key_break = f"{symbol}:{tf}:break"
+        # yakınlık hesabı (close dirence ne kadar yakın)
+        if resistance <= 0:
+            continue
+        dist_pct = abs(resistance - c) / resistance * 100
 
-    dt = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        # Fake breakout filtreleri
+        vols = [x[5] for x in candles]
+        vol_ok = volume_spike(vols, VOL_LOOKBACK, VOL_MULT)
+        body_good = body_ok(o, h, l, c, MIN_BODY_PCT)
 
-    # Breakout Onay: close >= resistance
-    if c >= resistance:
-        if cooldown_ok(state, key_break):
+        # Sinyal türü: Yakınlık veya Onaylı breakout
+        is_near = (dist_pct <= NEAR_PCT)
+        is_break = (c > resistance) if CONFIRM_BREAKOUT else (h > resistance)
+
+        # Trend filtresi (UP/DOWN’a göre davran)
+        # Biz “dirence yakın / breakout”ı daha çok long mantığında ele alıyoruz:
+        # Trend UP değilse sinyali bastır (istersen env ile açarsın)
+        trend_ok = (trend_4h == "UP" or trend_1d == "UP")
+
+        # cooldown anahtarı: pair + timeframe
+        key = f"{pair}:{tf_name}"
+        if not can_send(state, key):
+            continue
+
+        if (is_break or is_near) and trend_ok and vol_ok and body_good:
+            when = datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            left_pct = (resistance - c) / resistance * 100
+            left_pct_abs = abs(left_pct)
+
+            direction_tag = ""
+            if aligned:
+                direction_tag = f"\n🧭 Trend: 1H+4H+1D = {trend_1h}"
+
+            title = "🚀 Breakout Onay!" if is_break else "⚠️ Dirence Yakın"
             msg = (
-                f"🚀 {tf.upper()} Breakout Onay!\n"
-                f"Pair: {symbol}\n"
-                f"Fiyat (Close): {c}\n"
-                f"Direnç: {resistance}\n"
-                f"Hacim: ✅ (artış)\n"
-                f"EMA: ✅ (kesişim + trend)\n"
-                f"Align(1H+4H+1D): ✅\n"
-                f"Zaman: {dt}"
+                f"{title} ({tf_name})\n"
+                f"Pair: {pair}\n"
+                f"Close: {c:.8g}\n"
+                f"Direnç: {resistance:.8g}\n"
+                f"Kalan: {left_pct_abs:.2f}%\n"
+                f"📈 Hacim: x{VOL_MULT} OK\n"
+                f"📊 EMA({EMA_FAST}/{EMA_SLOW}) 4H:{trend_4h} 1D:{trend_1d}\n"
+                f"🕒 Zaman: {when}"
+                f"{direction_tag}"
             )
             send_message(msg)
-            mark_alert(state, key_break)
-        return
+            mark_sent(state, key)
 
-    # Dirence yakın (NEAR_PCT içinde)
-    if 0 <= near_pct <= NEAR_PCT:
-        if cooldown_ok(state, key_near):
-            msg = (
-                f"⚠️ Dirence Yakın ({tf.upper()})\n"
-                f"{symbol}\n"
-                f"Close: {c}\n"
-                f"Direnç: {resistance}\n"
-                f"Kalan: {near_pct:.2f}%\n"
-                f"Hacim: ✅  EMA: ✅  Align: ✅\n"
-                f"Zaman: {dt}"
-            )
-            send_message(msg)
-            mark_alert(state, key_near)
-
-
-def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN ve CHAT_ID Render env'de set değil.")
-        return
-
+def main_loop():
     state = load_state()
 
-    send_message("✅ Breakout bot (Gate.io) başladı. 4H & 1D tarama aktif.")
-    try:
-        pairs = list_usdt_pairs()
-    except Exception as e:
-        send_message(f"❌ Pair listesi alınamadı: {e}")
-        return
+    send_message("✅ Breakout bot (Gate.io) başladı. 4H & 1D tarama aktif.\n"
+                 f"Cooldown: {COOLDOWN_MIN}dk | VOL x{VOL_MULT} | EMA {EMA_FAST}/{EMA_SLOW}")
 
-    send_message(f"📌 Toplam {len(pairs)} USDT parite bulundu. Her turda MAX_PAIRS={MAX_PAIRS} taranacak.")
-
-    idx = 0
     while True:
         try:
-            # döngü içinde MAX_PAIRS kadar tarayıp sonra başa sar
-            chunk = pairs[idx: idx + MAX_PAIRS]
-            if not chunk:
-                idx = 0
-                continue
+            pairs = get_usdt_pairs()
+            send_message(f"📌 Toplam {len(pairs)} USDT parite bulundu. Her turda MAX_PAIRS={MAX_PAIRS} taranacak.")
+            # basit örnek: ilk MAX_PAIRS
+            for pair in pairs[:MAX_PAIRS]:
+                try:
+                    analyze_pair(pair, state)
+                except Exception as e:
+                    # tek parite patlarsa döngü ölmesin
+                    print("pair hata", pair, e)
 
-            for symbol in chunk:
-                # 4H
-                analyze_symbol_tf(state, symbol, "4h", LOOKBACK_4H)
-                # 1D
-                analyze_symbol_tf(state, symbol, "1d", LOOKBACK_1D)
-
-            idx += MAX_PAIRS
             save_state(state)
-            time.sleep(SLEEP_SECONDS)
-
         except Exception as e:
-            # hata olursa düşmesin
-            print("Loop error:", e)
-            time.sleep(10)
+            print("Genel hata:", e)
 
+        time.sleep(SLEEP_SECONDS)
 
 if __name__ == "__main__":
-    main()
-    import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+    # Web Service'in port testini geçmek için HTTP server
+    t = threading.Thread(target=start_http_server, daemon=True)
+    t.start()
 
-def _keepalive_server():
-    port = int(os.environ.get("PORT", "10000"))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, format, *args):
-            return
-
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
-threading.Thread(target=_keepalive_server, daemon=True).start()
+    # Bot döngüsü
+    main_loop()
+    
