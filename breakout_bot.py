@@ -349,3 +349,23 @@ def main():
 
 if __name__ == "__main__":
     main()
+    import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+def _keepalive_server():
+    port = int(os.environ.get("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            return
+
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+threading.Thread(target=_keepalive_server, daemon=True).start()
